@@ -13,6 +13,8 @@ Fixes all 8 strict engineering audit findings:
 8. Cross-platform CJK font support (Linux, macOS, Windows).
 """
 
+from report_support import CURRENCIES, compute_report_metrics, render_report_charts, build_report_html
+
 import argparse
 import base64
 from datetime import datetime
@@ -186,6 +188,10 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
     if missing_base:
         raise ValueError(f"CSV 缺少必要基础列: {missing_base}。当前可用列: {list(raw_df.columns)}")
 
+    basis = getattr(args, "report_basis", "net")
+    currency = getattr(args, "currency", "USD")
+    if args.estimate_missing_fees and currency != "USD":
+        raise ValueError("The built-in fee estimate is USD-only; provide actual fees for other currencies.")
     df = pd.DataFrame()
     df["订单号"] = raw_df[args.col_id].astype(str).str.strip()
     df["结算周期"] = raw_df[args.col_period].astype(str).str.strip()
@@ -206,6 +212,8 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
     elif args.estimate_missing_fees:
         print(f"[WARN] 缺少手续费列 '{args.col_fee}'，已按 --estimate-missing-fees 显式授权估算 (2.9% + $0.30)。")
         df["通道手续费_USD"] = (df["总流水_USD"] * 0.029 + 0.30).round(2)
+    elif basis == "gross":
+        df["通道手续费_USD"] = float("nan")
     else:
         raise ValueError(
             f"CSV 缺少手续费列 '{args.col_fee}'。请通过 '--col-fee' 指定列名，或显式传入 '--estimate-missing-fees' 启用估算。"
@@ -216,6 +224,8 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
     elif args.assume_zero_refunds:
         print(f"[WARN] 缺少退款列 '{args.col_refund}'，已按 --assume-zero-refunds 显式授权默认未退款。")
         df["是否退款"] = 0
+    elif basis == "gross":
+        df["是否退款"] = float("nan")
     else:
         raise ValueError(
             f"CSV 缺少退款标记列 '{args.col_refund}'。请通过 '--col-refund' 指定列名，或显式传入 '--assume-zero-refunds'。"
@@ -224,12 +234,24 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
     if args.col_net and args.col_net in raw_df.columns:
         df["净营收_USD"] = parse_strict_numeric_series(raw_df[args.col_net], args.col_net)
     elif args.derive_net_from_gross or not args.col_net:
+        if df["通道手续费_USD"].isna().any() or df["是否退款"].isna().any():
+            raise ValueError("Cannot derive net amount when fee or refund data is unavailable.")
         df["净营收_USD"] = np.where(df["是否退款"] == 1, 0.0, df["总流水_USD"] - df["通道手续费_USD"]).round(2)
+    elif basis == "gross":
+        df["净营收_USD"] = float("nan")
     else:
         raise ValueError(
             f"CSV 缺少净营收列 '{args.col_net}'。请传入 '--derive-net-from-gross' 允许按 (未退款时总流水 - 手续费) 推算。"
         )
 
+    df.attrs.update(
+        report_basis=basis, currency=currency, report_note=getattr(args, "report_note", ""),
+        field_status={
+            "fee": "provided" if args.col_fee in raw_df.columns else "estimated" if args.estimate_missing_fees else "unavailable",
+            "refund": "provided" if args.col_refund in raw_df.columns else "assumed" if args.assume_zero_refunds else "unavailable",
+            "net": "provided" if args.col_net in raw_df.columns else "derived" if args.derive_net_from_gross or not args.col_net else "unavailable",
+        },
+    )
     return df, source_path
 
 
@@ -262,161 +284,7 @@ def _aggregate_top_n_zh(records: list[dict], key_name: str, max_rows: int = 6) -
 
 
 def compute_metrics_zh(df: pd.DataFrame, refund_threshold: float = 3.5, max_table_rows: int = 6) -> dict:
-    """Computes 100% deterministic metrics with chronological sorting and consistent PoP states."""
-    total_rows = int(len(df))
-    gross_total = float(df["总流水_USD"].sum())
-    net_total = float(df["净营收_USD"].sum())
-    fee_total = float(df["通道手续费_USD"].sum())
-    net_realization_rate_pct = round((net_total / gross_total * 100.0), 1) if gross_total > 0 else 0.0
-    refund_rate = float(df["是否退款"].mean() * 100.0)
-    aov = float(gross_total / total_rows) if total_rows > 0 else 0.0
-
-    weekly = df.groupby("结算周期", as_index=False).agg(
-        sort_key=("_sort_key", "first"),
-        txns=("订单号", "count"),
-        gross=("总流水_USD", "sum"),
-        net=("净营收_USD", "sum"),
-        refund_pct=("是否退款", lambda x: round(float(x.mean() * 100.0), 2)),
-    ).sort_values(by="sort_key").drop(columns=["sort_key"]).reset_index(drop=True)
-
-    latest_week = str(weekly.iloc[-1]["结算周期"])
-    latest_week_net = round(float(weekly.iloc[-1]["net"]), 2)
-
-    if len(weekly) < 2:
-        wow_net_delta = None
-        wow_delta_str = f"不可计算 (单周期: {latest_week})"
-        delta_prose = f"（当前仅含单周期 {latest_week} 数据，环比不可计算）"
-    else:
-        prev_week = str(weekly.iloc[-2]["结算周期"])
-        w_prev_net = float(weekly.iloc[-2]["net"])
-        if w_prev_net <= 0:
-            wow_net_delta = None
-            wow_delta_str = f"不可计算 (上期 {prev_week} <= $0)"
-            delta_prose = f"（{latest_week} 当期净营收 ${latest_week_net:,.2f}；因上期 {prev_week} 净营收为 ${w_prev_net:,.2f}，环比百分比不可计算）"
-        else:
-            wow_net_delta = round(((latest_week_net - w_prev_net) / w_prev_net) * 100.0, 1)
-            wow_delta_str = f"{'+' if wow_net_delta >= 0 else ''}{wow_net_delta}% ({latest_week} 对比 {prev_week})"
-            delta_prose = f"带动 {latest_week} 单周期净营收较 {prev_week} 环比变动 {wow_net_delta:+.1f}%"
-
-    df_latest = df[df["结算周期"].astype(str) == latest_week]
-    latest_stats = df_latest.groupby("业务渠道")["是否退款"].agg(["count", "sum"])
-    latest_ch_refunds = (latest_stats["sum"] / latest_stats["count"] * 100).round(2).to_dict()
-    latest_counts = latest_stats["count"].to_dict()
-    latest_refunded = latest_stats["sum"].to_dict()
-
-    by_channel = df.groupby("业务渠道", as_index=False).agg(
-        txns=("订单号", "count"),
-        refunded_txns=("是否退款", "sum"),
-        gross=("总流水_USD", "sum"),
-        net=("净营收_USD", "sum"),
-        refund_pct=("是否退款", lambda x: round(float(x.mean() * 100.0), 2)),
-    ).sort_values(by="net", ascending=False).reset_index(drop=True)
-
-    by_channel["share_pct"] = np.where(net_total > 0, (by_channel["net"] / net_total * 100.0).round(1), 0.0)
-    by_channel["latest_refund_pct"] = by_channel["业务渠道"].map(lambda c: latest_ch_refunds.get(c, 0.0))
-
-    channel_records_full = []
-    anomalies = []
-    for _, r in by_channel.iterrows():
-        c_name = str(r["业务渠道"])
-        cum_ref = float(r["refund_pct"])
-        lat_ref = float(r["latest_refund_pct"])
-        is_anomaly = (cum_ref > refund_threshold) or (lat_ref > refund_threshold * 1.5)
-        if is_anomaly:
-            status_str = f"⚠ 异常预警：{latest_week}当期退款率 {lat_ref}% (累计 {cum_ref}%)"
-            anomalies.append({
-                "业务渠道": c_name,
-                "cumulative_refund_pct": cum_ref,
-                "latest_period_refund_pct": lat_ref,
-                "period": latest_week,
-                "threshold_pct": refund_threshold,
-            })
-        else:
-            status_str = f"✓ 正常受控 (<{refund_threshold}%)"
-
-        channel_records_full.append({
-            "业务渠道": c_name,
-            "txns": int(r["txns"]),
-            "refunded_txns": int(r["refunded_txns"]),
-            "latest_txns": int(latest_counts.get(c_name, 0)),
-            "latest_refunded_txns": int(latest_refunded.get(c_name, 0)),
-            "gross": round(float(r["gross"]), 2),
-            "net": round(float(r["net"]), 2),
-            "share_pct": float(r["share_pct"]),
-            "refund_pct": cum_ref,
-            "latest_refund_pct": lat_ref,
-            "status": status_str,
-            "is_anomaly": bool(is_anomaly),
-        })
-
-    by_region = df.groupby("销售大区", as_index=False).agg(
-        txns=("订单号", "count"),
-        net=("净营收_USD", "sum"),
-    ).sort_values(by="net", ascending=False).reset_index(drop=True)
-    by_region["share_pct"] = np.where(net_total > 0, (by_region["net"] / net_total * 100.0).round(1), 0.0)
-
-    region_records_full = [
-        {
-            "销售大区": str(r["销售大区"]),
-            "txns": int(r["txns"]),
-            "net": round(float(r["net"]), 2),
-            "share_pct": float(r["share_pct"]),
-        }
-        for _, r in by_region.iterrows()
-    ]
-
-    top_ch = channel_records_full[0]
-    bullet_1 = (
-        f"核心营收支柱 — {top_ch['业务渠道']}：凭 {top_ch['txns']:,} 笔订单贡献了 "
-        f"${top_ch['net']:,.2f} 净营收（占总盘 {top_ch['share_pct']}%，支付净额留存率（扣除手续费与退款后 {net_realization_rate_pct}%）），{delta_prose}。"
-    )
-
-    if anomalies:
-        worst = sorted(anomalies, key=lambda x: x["latest_period_refund_pct"], reverse=True)[0]
-        bullet_2 = (
-            f"阈值熔断预警 — {worst['业务渠道']}退款率异动：自动化审计捕获该渠道在 {worst['period']} "
-            f"当期退款率达 {worst['latest_period_refund_pct']}%（累计退款率 {worst['cumulative_refund_pct']}%，超出 {refund_threshold}% 预设红线）。"
-            f"鉴于交易流水表不含故障日志，建议联动排查近期客服工单与支付网关日志以定位具体原因。"
-        )
-    else:
-        max_ref_ch = sorted(channel_records_full, key=lambda x: x["refund_pct"], reverse=True)[0]
-        bullet_2 = (
-            f"退款率健康受控：全部业务渠道累计退款率均低于 {refund_threshold}% 预警阈值"
-            f"（当前最高为“{max_ref_ch['业务渠道']}”的 {max_ref_ch['refund_pct']}%）。"
-        )
-
-    if len(region_records_full) >= 2:
-        r1, r2 = region_records_full[0], region_records_full[1]
-        combined_share = round(r1["share_pct"] + r2["share_pct"], 1)
-        bullet_3 = (
-            f"区域营收集中度：{r1['销售大区']}（${r1['net']:,.2f}，占 {r1['share_pct']}%）与 "
-            f"{r2['销售大区']}（${r2['net']:,.2f}，占 {r2['share_pct']}%）合计贡献了 {combined_share}% 的净营收总额。"
-        )
-    else:
-        r1 = region_records_full[0]
-        bullet_3 = f"区域营收分布：{r1['销售大区']} 贡献了 ${r1['net']:,.2f}（占比 {r1['share_pct']}%）。"
-
-    return {
-        "total_rows": total_rows,
-        "gross_total": round(gross_total, 2),
-        "net_total": round(net_total, 2),
-        "fee_total": round(fee_total, 2),
-        "net_realization_rate_pct": net_realization_rate_pct,
-        "refund_rate": round(refund_rate, 2),
-        "aov": round(aov, 2),
-        "latest_week": latest_week,
-        "latest_week_net": latest_week_net,
-        "wow_net_delta": wow_net_delta,
-        "wow_delta_str": wow_delta_str,
-        "refund_threshold": refund_threshold,
-        "executive_bullets": [bullet_1, bullet_2, bullet_3],
-        "anomalies": anomalies,
-        "weekly": weekly.to_dict(orient="records"),
-        "by_channel": _aggregate_top_n_zh(channel_records_full, "业务渠道", max_table_rows),
-        "by_region": _aggregate_top_n_zh(region_records_full, "销售大区", max_table_rows),
-        "total_distinct_channels": len(channel_records_full),
-        "total_distinct_regions": len(region_records_full),
-    }
+    return compute_report_metrics(df, refund_threshold, max_table_rows, language="zh")
 
 
 def lint_executive_copy_zh(bullets: list[str]) -> list[str]:
@@ -432,220 +300,10 @@ def lint_executive_copy_zh(bullets: list[str]) -> list[str]:
 
 
 def render_charts_zh(metrics: dict, chart_path: str) -> None:
-    plt.rcParams["font.sans-serif"] = [
-        "Noto Sans CJK SC", "Noto Sans CJK JP", "PingFang SC", "Hiragino Sans GB",
-        "Microsoft YaHei", "SimHei", "Inter", "DejaVu Sans"
-    ]
-    plt.rcParams["axes.unicode_minus"] = False
-
-    weekly = pd.DataFrame(metrics["weekly"])
-    by_ch = pd.DataFrame(metrics["by_channel"])
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 2.15), dpi=200)
-
-    ax1.plot(weekly["结算周期"], weekly["net"] / 1000.0, marker="o", linewidth=2.5, color=PRIMARY)
-    ax1.fill_between(weekly["结算周期"], weekly["net"] / 1000.0, color=PRIMARY, alpha=0.08)
-    ax1.set_title("周期净营收增长趋势 (单位: 千美元 $K)", fontsize=10, fontweight="bold", color=PRIMARY, pad=8)
-    ax1.set_ylabel("净营收 ($K)", fontsize=8.5, color=PRIMARY)
-    ax1.tick_params(axis="x", rotation=25, labelsize=8)
-    ax1.tick_params(axis="y", labelsize=8)
-    ax1.spines["top"].set_visible(False)
-    ax1.spines["right"].set_visible(False)
-    ax1.yaxis.grid(True, linestyle="--", alpha=0.4)
-
-    for idx, row in weekly.iterrows():
-        if idx in [0, len(weekly) - 1]:
-            ax1.annotate(
-                f"${row['net']/1000:.1f}K",
-                (row["结算周期"], row["net"] / 1000.0),
-                textcoords="offset points",
-                xytext=(0, 6),
-                ha="center",
-                fontsize=8,
-                fontweight="bold",
-                color=ACCENT if idx == len(weekly) - 1 else PRIMARY,
-            )
-
-    colors = [ACCENT if i == 0 else PRIMARY if i == 1 else SECONDARY for i in range(len(by_ch))]
-    y_pos = np.arange(len(by_ch))
-    bars = ax2.barh(y_pos, by_ch["net"] / 1000.0, color=colors, height=0.55)
-    ax2.set_yticks(y_pos)
-    ax2.set_yticklabels([str(c)[:16] for c in by_ch["业务渠道"]], fontsize=8.5, fontweight="bold", color=PRIMARY)
-    ax2.invert_yaxis()
-    max_val = max(float(by_ch["net"].max()) / 1000.0, 1.0)
-    ax2.set_xlim(0, max_val * 1.30)
-    ax2.set_title("各业务渠道净营收贡献占比 ($K)", fontsize=10, fontweight="bold", color=PRIMARY, pad=8)
-    ax2.spines["top"].set_visible(False)
-    ax2.spines["right"].set_visible(False)
-    ax2.xaxis.grid(True, linestyle="--", alpha=0.4)
-
-    for bar, (_, row) in zip(bars, by_ch.iterrows()):
-        ax2.text(
-            bar.get_width() + (max_val * 0.02),
-            bar.get_y() + bar.get_height() / 2,
-            f"${row['net']/1000:.1f}K ({row['share_pct']}%)",
-            va="center",
-            ha="left",
-            fontsize=8,
-            fontweight="bold",
-            color=PRIMARY,
-        )
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(chart_path)), exist_ok=True)
-    plt.savefig(chart_path, dpi=200, bbox_inches="tight")
-    plt.close()
-
+    render_report_charts(metrics, chart_path)
 
 def build_pdf_html_zh(metrics: dict, chart_path: str, html_path: str) -> None:
-    with open(chart_path, "rb") as f:
-        chart_b64 = base64.b64encode(f.read()).decode("ascii")
-
-    ch_rows = ""
-    for r in metrics["by_channel"]:
-        ch_rows += f"""
-        <tr>
-          <td><strong>{r['业务渠道']}</strong></td>
-          <td style="text-align:right;">{r['txns']:,} 笔</td>
-          <td style="text-align:right;">${r['gross']:,.2f}</td>
-          <td style="text-align:right;"><strong>${r['net']:,.2f}</strong></td>
-          <td style="text-align:right;">{r['share_pct']}%</td>
-          <td style="text-align:right;">{r['refund_pct']}%</td>
-          <td>{r['status']}</td>
-        </tr>"""
-
-    reg_rows = ""
-    for r in metrics["by_region"]:
-        reg_rows += f"""
-        <tr>
-          <td><strong>{r['销售大区']}</strong></td>
-          <td style="text-align:right;">{r['txns']:,} 笔</td>
-          <td style="text-align:right;"><strong>${r['net']:,.2f}</strong></td>
-          <td style="text-align:right;">{r['share_pct']}%</td>
-        </tr>"""
-
-    bullets_html = "\n".join(f"      <li>{b}</li>" for b in metrics["executive_bullets"])
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh-Hans">
-<head>
-  <meta charset="utf-8">
-  <style>
-    :root {{
-      --primary: #0F2537;
-      --accent: #D95D39;
-      --text: #1E293B;
-      --bg: #FFFFFF;
-    }}
-    @page {{
-      size: A4;
-      margin: 12mm 15mm;
-      background: var(--bg);
-      @bottom-right {{
-        content: "由 Deliverable-First AI Skill v2.2 自动生成 | 第 " counter(page) " 页";
-        font-family: 'Noto Sans CJK SC', 'PingFang SC', 'Microsoft YaHei', 'Inter', sans-serif;
-        font-size: 8pt;
-        color: #64748B;
-      }}
-    }}
-    *, *::before, *::after {{ box-sizing: border-box; border: none; border-radius: 0; box-shadow: none; background: transparent; }}
-    html, body {{ margin: 0; padding: 0; font-family: 'Inter', 'Noto Sans CJK SC', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 9.5pt; line-height: 1.45; color: var(--text); }}
-    .full-bleed-header {{ background: var(--primary); color: #fff; padding: 10px 18px; margin-bottom: 8px; }}
-    .full-bleed-header h1 {{ color: #fff; font-size: 15pt; margin: 0 0 4px 0; font-weight: 800; }}
-    .full-bleed-header p {{ color: #CBD5E1; font-size: 9pt; margin: 0; }}
-    h2 {{ font-size: 11pt; color: var(--primary); margin: 8px 0 4px 0; font-weight: 700; break-after: avoid; }}
-    p, ul {{ margin: 0 0 8px 0; }}
-    ul {{ padding-left: 18px; }}
-    li {{ margin-bottom: 4px; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 4px 0 8px 0; }}
-    th, td {{ padding: 4px 7px; font-size: 9pt; text-align: left; }}
-    th {{ border-bottom: 2px solid var(--primary); color: var(--primary); font-weight: 700; }}
-    td {{ border-bottom: 1px solid rgba(0,0,0,0.08); }}
-    figure {{ margin: 8px 0; break-inside: avoid; }}
-    img {{ width: 100%; height: auto; display: block; }}
-    tr {{ break-inside: avoid; }}
-  </style>
-</head>
-<body>
-  <main class="document-flow">
-    <div class="full-bleed-header">
-      <h1>周度经营与渠道利润自动审计高管简报 ({metrics['latest_week']})</h1>
-      <p>自动化渲染管线 v2.2：Pandas 确定性核算 + Chromium 矢量排版 | 已核验记录：{metrics['total_rows']:,} 行 | 支付净额留存率（扣除手续费与退款后：{metrics['net_realization_rate_pct']}%）</p>
-    </div>
-
-    <p>支付净额留存率 = 净营收 ÷ 总流水；通常反映手续费及退款后的留存，不包含运营费用、销售成本或税费。若净额由 CSV 提供，其口径取决于数据源。</p>
-    <h2>1. 核心财务与运营指标总览（Pandas 100% 确定性计算 — 零大模型算术幻觉）</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>累计核算订单数</th>
-          <th style="text-align:right;">总流水金额 (Gross)</th>
-          <th style="text-align:right;">支付通道手续费</th>
-          <th style="text-align:right;">实际净营收 (Net)</th>
-          <th style="text-align:right;">平均客单价 (AOV)</th>
-          <th style="text-align:right;">最新周期净增幅</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><strong>{metrics['total_rows']:,} 笔</strong></td>
-          <td style="text-align:right;">${metrics['gross_total']:,.2f}</td>
-          <td style="text-align:right;">${metrics['fee_total']:,.2f}</td>
-          <td style="text-align:right;"><strong>${metrics['net_total']:,.2f}</strong></td>
-          <td style="text-align:right;">${metrics['aov']:,.2f}</td>
-          <td style="text-align:right;"><strong>{metrics['wow_delta_str']}</strong></td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>2. 数据驱动高管归因摘要与异常审计（已通过代码级去 AI 塑料感正则扫描）</h2>
-    <ul>
-{bullets_html}
-    </ul>
-
-    <figure>
-      <img src="data:image/png;base64,{chart_b64}" alt="周度趋势与渠道分布图">
-    </figure>
-
-    <h2>3. 业务渠道明细与自动化利润审计表</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>业务渠道名称</th>
-          <th style="text-align:right;">成交笔数</th>
-          <th style="text-align:right;">总流水 (USD)</th>
-          <th style="text-align:right;">净营收 (USD)</th>
-          <th style="text-align:right;">净营收占比</th>
-          <th style="text-align:right;">累计退款率</th>
-          <th>脚本自动审计状态</th>
-        </tr>
-      </thead>
-      <tbody>
-        {ch_rows}
-      </tbody>
-    </table>
-
-    <h2>4. 全球销售大区净营收分布</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>销售大区</th>
-          <th style="text-align:right;">有效订单数</th>
-          <th style="text-align:right;">净营收总额 (USD)</th>
-          <th style="text-align:right;">大区营收占比</th>
-        </tr>
-      </thead>
-      <tbody>
-        {reg_rows}
-      </tbody>
-    </table>
-  </main>
-</body>
-</html>"""
-
-    os.makedirs(os.path.dirname(os.path.abspath(html_path)), exist_ok=True)
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    build_report_html(metrics, chart_path, html_path)
 
 
 def compile_html_to_pdf_and_verify(html_path: str, pdf_path: str, max_pages: int = 1, allow_html_only: bool = False) -> bool:
@@ -796,6 +454,9 @@ def render_x_card_zh(raw_csv_path: str, pdf_path: str, x_card_path: str, total_r
 
 def parse_args_zh() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deterministic CSV-to-Executive-PDF Pipeline v2.2 (Chinese Edition)")
+    parser.add_argument("--currency", choices=list(CURRENCIES), default="USD", help="Input currency; labeling only, no conversion.")
+    parser.add_argument("--report-basis", choices=["net", "gross"], default="net", help="Gross mode permits unavailable fee/refund/net columns; net mode remains strict.")
+    parser.add_argument("--report-note", default="", help="Source, scope and exclusions shown on the report.")
     parser.add_argument("--input", type=str, default="", help="输入现有 CSV 路径。")
     parser.add_argument("--demo", action="store_true", help="显式生成并运行 4,200 行中文模拟演示数据集。")
     parser.add_argument("--demo-csv-out", type=str, default="raw_orders_zh_4200_rows.csv", help="中文演示 CSV 输出路径。")
@@ -832,7 +493,7 @@ def main() -> None:
 
         os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
         with open(args.output_json, "w", encoding="utf-8") as jf:
-            json.dump(metrics_data, jf, indent=2, ensure_ascii=False)
+            json.dump(metrics_data, jf, indent=2, ensure_ascii=False, allow_nan=False)
         print(f"[METRICS VERIFIED] 已导出中文确定性核算指标 JSON: {args.output_json}")
 
         lint_executive_copy_zh(metrics_data["executive_bullets"])
@@ -848,7 +509,7 @@ def main() -> None:
             render_x_card_zh(csv_source_path, args.output_pdf, args.output_card, total_rows=metrics_data["total_rows"])
 
         elapsed = round(time.time() - t0, 2)
-        print(f"[SUCCESS] 中文端到端渲染管线校验完毕，耗时 {elapsed}s。")
+        print(f"[SUCCESS] 中文 PDF 管线完成，耗时 {elapsed}s。" if pdf_ok else f"[HTML ONLY] 未生成 PDF，耗时 {elapsed}s。")
     except (FileNotFoundError, ValueError, RuntimeError) as err:
         sys.stderr.write(f"[PIPELINE ERROR] {err}\n")
         sys.exit(2)

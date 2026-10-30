@@ -19,6 +19,8 @@ When invoked on a `.csv` file, follow this strict 4-stage deterministic pipeline
    - When the dataset has only 1 period or prior-period net revenue is `<= 0`, set `wow_net_delta = null` and output `"N/A"` across JSON, KPI table, and executive prose (never output a contradictory `+0.0%`).
 3. Export verified metrics to `summary_metrics.json`.
 
+For sales-only datasets, use `--report-basis gross` and set the observed input currency with `--currency` (USD, GBP, EUR, CNY or JPY). Absent fee, refund and net columns must remain unavailable; never insert placeholder zeros. JSON uses `null` and the PDF states “Not provided”. Do not claim refund compliance when refund flags are missing or assumed. Gross reports show gross-sales period changes and shares, not net results. Supplied columns retain strict validation; net mode retains its required financial inputs. The fee estimator is USD-only. Currency selection does not perform conversion. Record source, period, exclusions and synthetic classifications with `--report-note`; do not present dataset classifications as observed acquisition channels. Keep `report_support.py` beside both entry-point scripts.
+
 ## Stage 2: Locked Two-Tone Vector Chart Generation (`matplotlib`)
 1. Pre-render charts at 200 DPI using `matplotlib` with `bbox_inches='tight'`.
 2. Enforce the executive color palette (`#0F2537` Primary Navy, `#D95D39` Accent Terracotta, `#2E6B9E` Secondary Blue) and cross-platform CJK font fallback (`Noto Sans CJK SC`, `PingFang SC`, `Microsoft YaHei`).

@@ -13,6 +13,8 @@ Fixes all 8 strict engineering audit findings:
 8. 100% alignment between SKILL.md, README.md, and code implementation (Net Realization Rate, Top Channels, Refund SLA Audit).
 """
 
+from report_support import CURRENCIES, compute_report_metrics, render_report_charts, build_report_html
+
 import argparse
 import base64
 from datetime import datetime
@@ -191,6 +193,10 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
             f"Missing required columns in CSV: {missing_base}. Available columns: {list(raw_df.columns)}"
         )
 
+    basis = getattr(args, "report_basis", "net")
+    currency = getattr(args, "currency", "USD")
+    if args.estimate_missing_fees and currency != "USD":
+        raise ValueError("The built-in fee estimate is USD-only; provide actual fees for other currencies.")
     df = pd.DataFrame()
     df["txn_id"] = raw_df[args.col_id].astype(str).str.strip()
     df["week"] = raw_df[args.col_period].astype(str).str.strip()
@@ -214,6 +220,8 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     elif args.estimate_missing_fees:
         print(f"[WARN] Column '{args.col_fee}' absent; estimating fees via --estimate-missing-fees (2.9% + $0.30).")
         df["stripe_fee_usd"] = (df["gross_usd"] * 0.029 + 0.30).round(2)
+    elif basis == "gross":
+        df["stripe_fee_usd"] = float("nan")
     else:
         raise ValueError(
             f"Fee column '{args.col_fee}' is missing from CSV. Pass '--col-fee <column_name>' or "
@@ -226,6 +234,8 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     elif args.assume_zero_refunds:
         print(f"[WARN] Column '{args.col_refund}' absent; setting refunded=0 via --assume-zero-refunds.")
         df["refunded"] = 0
+    elif basis == "gross":
+        df["refunded"] = float("nan")
     else:
         raise ValueError(
             f"Refund column '{args.col_refund}' is missing from CSV. Pass '--col-refund <column_name>' or "
@@ -236,13 +246,25 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     if args.col_net and args.col_net in raw_df.columns:
         df["net_usd"] = parse_strict_numeric_series(raw_df[args.col_net], args.col_net)
     elif args.derive_net_from_gross or not args.col_net:
+        if df["stripe_fee_usd"].isna().any() or df["refunded"].isna().any():
+            raise ValueError("Cannot derive net amount when fee or refund data is unavailable.")
         df["net_usd"] = np.where(df["refunded"] == 1, 0.0, df["gross_usd"] - df["stripe_fee_usd"]).round(2)
+    elif basis == "gross":
+        df["net_usd"] = float("nan")
     else:
         raise ValueError(
             f"Net revenue column '{args.col_net}' is missing from CSV. Pass '--derive-net-from-gross' "
             f"to compute net_usd = (0 if refunded else gross - fee)."
         )
 
+    df.attrs.update(
+        report_basis=basis, currency=currency, report_note=getattr(args, "report_note", ""),
+        field_status={
+            "fee": "provided" if args.col_fee in raw_df.columns else "estimated" if args.estimate_missing_fees else "unavailable",
+            "refund": "provided" if args.col_refund in raw_df.columns else "assumed" if args.assume_zero_refunds else "unavailable",
+            "net": "provided" if args.col_net in raw_df.columns else "derived" if args.derive_net_from_gross or not args.col_net else "unavailable",
+        },
+    )
     return df, source_path
 
 
@@ -275,168 +297,7 @@ def _aggregate_top_n(records: list[dict], key_name: str, max_rows: int = 6) -> l
 
 
 def compute_deterministic_metrics(df: pd.DataFrame, refund_threshold: float = 3.5, max_table_rows: int = 6) -> dict:
-    """Computes 100% deterministic metrics with chronological period sorting and consistent PoP states."""
-    total_rows = int(len(df))
-    gross_total = float(df["gross_usd"].sum())
-    net_total = float(df["net_usd"].sum())
-    fee_total = float(df["stripe_fee_usd"].sum())
-    net_realization_rate_pct = round((net_total / gross_total * 100.0), 1) if gross_total > 0 else 0.0
-    refund_rate = float(df["refunded"].mean() * 100.0)
-    aov = float(gross_total / total_rows) if total_rows > 0 else 0.0
-
-    # Group by week and sort chronologically using _sort_key
-    weekly = df.groupby("week", as_index=False).agg(
-        sort_key=("_sort_key", "first"),
-        txns=("txn_id", "count"),
-        gross=("gross_usd", "sum"),
-        net=("net_usd", "sum"),
-        refund_pct=("refunded", lambda x: round(float(x.mean() * 100.0), 2)),
-    ).sort_values(by="sort_key").drop(columns=["sort_key"]).reset_index(drop=True)
-
-    latest_week = str(weekly.iloc[-1]["week"])
-    latest_week_net = round(float(weekly.iloc[-1]["net"]), 2)
-
-    # Consistent PoP / WoW Delta calculation (never outputs +0.0% when prior period is 0 or missing)
-    if len(weekly) < 2:
-        wow_net_delta = None
-        wow_delta_str = f"N/A (Single Period: {latest_week})"
-        delta_prose = f"in single-period dataset {latest_week} (period-over-period delta not applicable)"
-    else:
-        prev_week = str(weekly.iloc[-2]["week"])
-        w_prev_net = float(weekly.iloc[-2]["net"])
-        if w_prev_net <= 0:
-            wow_net_delta = None
-            wow_delta_str = f"N/A (Prior Period {prev_week} <= $0)"
-            delta_prose = (
-                f"with {latest_week} net revenue at ${latest_week_net:,.2f} "
-                f"(period-over-period percentage delta not calculable because {prev_week} net revenue was ${w_prev_net:,.2f})"
-            )
-        else:
-            wow_net_delta = round(((latest_week_net - w_prev_net) / w_prev_net) * 100.0, 1)
-            wow_delta_str = f"{'+' if wow_net_delta >= 0 else ''}{wow_net_delta}% ({latest_week} vs {prev_week})"
-            delta_prose = f"with {latest_week} net revenue changing {wow_net_delta:+.1f}% vs {prev_week}"
-
-    df_latest = df[df["week"].astype(str) == latest_week]
-    latest_stats = df_latest.groupby("channel")["refunded"].agg(["count", "sum"])
-    latest_ch_refunds = (latest_stats["sum"] / latest_stats["count"] * 100).round(2).to_dict()
-    latest_counts = latest_stats["count"].to_dict()
-    latest_refunded = latest_stats["sum"].to_dict()
-
-    by_channel = df.groupby("channel", as_index=False).agg(
-        txns=("txn_id", "count"),
-        refunded_txns=("refunded", "sum"),
-        gross=("gross_usd", "sum"),
-        net=("net_usd", "sum"),
-        refund_pct=("refunded", lambda x: round(float(x.mean() * 100.0), 2)),
-    ).sort_values(by="net", ascending=False).reset_index(drop=True)
-
-    by_channel["share_pct"] = np.where(net_total > 0, (by_channel["net"] / net_total * 100.0).round(1), 0.0)
-    by_channel["latest_refund_pct"] = by_channel["channel"].map(lambda c: latest_ch_refunds.get(c, 0.0))
-
-    channel_records_full = []
-    anomalies = []
-    for _, r in by_channel.iterrows():
-        c_name = str(r["channel"])
-        cum_ref = float(r["refund_pct"])
-        lat_ref = float(r["latest_refund_pct"])
-        is_anomaly = (cum_ref > refund_threshold) or (lat_ref > refund_threshold * 1.5)
-        if is_anomaly:
-            status_str = f"⚠ Anomaly: {lat_ref}% in {latest_week} (Cum: {cum_ref}%)"
-            anomalies.append({
-                "channel": c_name,
-                "cumulative_refund_pct": cum_ref,
-                "latest_period_refund_pct": lat_ref,
-                "period": latest_week,
-                "threshold_pct": refund_threshold,
-            })
-        else:
-            status_str = f"✓ Within Target (<{refund_threshold}%)"
-
-        channel_records_full.append({
-            "channel": c_name,
-            "txns": int(r["txns"]),
-            "refunded_txns": int(r["refunded_txns"]),
-            "latest_txns": int(latest_counts.get(c_name, 0)),
-            "latest_refunded_txns": int(latest_refunded.get(c_name, 0)),
-            "gross": round(float(r["gross"]), 2),
-            "net": round(float(r["net"]), 2),
-            "share_pct": float(r["share_pct"]),
-            "refund_pct": cum_ref,
-            "latest_refund_pct": lat_ref,
-            "status": status_str,
-            "is_anomaly": bool(is_anomaly),
-        })
-
-    by_region = df.groupby("region", as_index=False).agg(
-        txns=("txn_id", "count"),
-        net=("net_usd", "sum"),
-    ).sort_values(by="net", ascending=False).reset_index(drop=True)
-    by_region["share_pct"] = np.where(net_total > 0, (by_region["net"] / net_total * 100.0).round(1), 0.0)
-
-    region_records_full = [
-        {
-            "region": str(r["region"]),
-            "txns": int(r["txns"]),
-            "net": round(float(r["net"]), 2),
-            "share_pct": float(r["share_pct"]),
-        }
-        for _, r in by_region.iterrows()
-    ]
-
-    top_ch = channel_records_full[0]
-    bullet_1 = (
-        f"Primary Revenue Driver — {top_ch['channel']}: Generated ${top_ch['net']:,.2f} "
-        f"({top_ch['share_pct']}% of total net revenue, overall net realization rate {net_realization_rate_pct}%) across {top_ch['txns']:,} transactions, "
-        f"{delta_prose}."
-    )
-
-    if anomalies:
-        worst = sorted(anomalies, key=lambda x: x["latest_period_refund_pct"], reverse=True)[0]
-        bullet_2 = (
-            f"Threshold Alert — {worst['channel']} Refund Rate: Automated checks flagged a "
-            f"{worst['latest_period_refund_pct']}% refund rate in {worst['period']} "
-            f"(cumulative rate: {worst['cumulative_refund_pct']}%, exceeding the {refund_threshold}% SLA threshold). "
-            f"Evidence is limited to transaction records; cross-check support tickets and payment gateway logs to isolate the root cause."
-        )
-    else:
-        max_ref_ch = sorted(channel_records_full, key=lambda x: x["refund_pct"], reverse=True)[0]
-        bullet_2 = (
-            f"Refund SLA Compliance: All channels remained within the {refund_threshold}% refund threshold "
-            f"(highest cumulative rate observed in {max_ref_ch['channel']} at {max_ref_ch['refund_pct']}%)."
-        )
-
-    if len(region_records_full) >= 2:
-        r1, r2 = region_records_full[0], region_records_full[1]
-        combined_share = round(r1["share_pct"] + r2["share_pct"], 1)
-        bullet_3 = (
-            f"Geographic Concentration: {r1['region']} (${r1['net']:,.2f}, {r1['share_pct']}%) and "
-            f"{r2['region']} (${r2['net']:,.2f}, {r2['share_pct']}%) accounted for {combined_share}% of total net volume."
-        )
-    else:
-        r1 = region_records_full[0]
-        bullet_3 = f"Geographic Concentration: {r1['region']} generated ${r1['net']:,.2f} ({r1['share_pct']}% of net volume)."
-
-    return {
-        "total_rows": total_rows,
-        "gross_total": round(gross_total, 2),
-        "net_total": round(net_total, 2),
-        "fee_total": round(fee_total, 2),
-        "net_realization_rate_pct": net_realization_rate_pct,
-        "refund_rate": round(refund_rate, 2),
-        "aov": round(aov, 2),
-        "latest_week": latest_week,
-        "latest_week_net": latest_week_net,
-        "wow_net_delta": wow_net_delta,
-        "wow_delta_str": wow_delta_str,
-        "refund_threshold": refund_threshold,
-        "executive_bullets": [bullet_1, bullet_2, bullet_3],
-        "anomalies": anomalies,
-        "weekly": weekly.to_dict(orient="records"),
-        "by_channel": _aggregate_top_n(channel_records_full, "channel", max_table_rows),
-        "by_region": _aggregate_top_n(region_records_full, "region", max_table_rows),
-        "total_distinct_channels": len(channel_records_full),
-        "total_distinct_regions": len(region_records_full),
-    }
+    return compute_report_metrics(df, refund_threshold, max_table_rows, language="en")
 
 
 def lint_executive_copy(bullets: list[str]) -> list[str]:
@@ -453,221 +314,10 @@ def lint_executive_copy(bullets: list[str]) -> list[str]:
 
 
 def render_executive_charts(metrics: dict, chart_path: str) -> None:
-    """Renders high-DPI locked 2-tone charts with cross-platform font fallback."""
-    plt.rcParams["font.sans-serif"] = [
-        "Inter", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", "DejaVu Sans", "Arial"
-    ]
-    plt.rcParams["axes.unicode_minus"] = False
-
-    weekly = pd.DataFrame(metrics["weekly"])
-    by_ch = pd.DataFrame(metrics["by_channel"])
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 2.5), dpi=200)
-
-    ax1.plot(weekly["week"], weekly["net"] / 1000.0, marker="o", linewidth=2.5, color=PRIMARY)
-    ax1.fill_between(weekly["week"], weekly["net"] / 1000.0, color=PRIMARY, alpha=0.08)
-    ax1.set_title("Period Net Revenue Trend ($K USD)", fontsize=10, fontweight="bold", color=PRIMARY, pad=8)
-    ax1.set_ylabel("Net Revenue ($K)", fontsize=8.5, color=PRIMARY)
-    ax1.tick_params(axis="x", rotation=25, labelsize=8)
-    ax1.tick_params(axis="y", labelsize=8)
-    ax1.spines["top"].set_visible(False)
-    ax1.spines["right"].set_visible(False)
-    ax1.yaxis.grid(True, linestyle="--", alpha=0.4)
-
-    for idx, row in weekly.iterrows():
-        if idx in [0, len(weekly) - 1]:
-            ax1.annotate(
-                f"${row['net']/1000:.1f}K",
-                (row["week"], row["net"] / 1000.0),
-                textcoords="offset points",
-                xytext=(0, 6),
-                ha="center",
-                fontsize=8,
-                fontweight="bold",
-                color=ACCENT if idx == len(weekly) - 1 else PRIMARY,
-            )
-
-    colors = [ACCENT if i == 0 else PRIMARY if i == 1 else SECONDARY for i in range(len(by_ch))]
-    y_pos = np.arange(len(by_ch))
-    bars = ax2.barh(y_pos, by_ch["net"] / 1000.0, color=colors, height=0.55)
-    ax2.set_yticks(y_pos)
-    ax2.set_yticklabels([str(c)[:26] for c in by_ch["channel"]], fontsize=8.5, fontweight="bold", color=PRIMARY)
-    ax2.invert_yaxis()
-    max_val = max(float(by_ch["net"].max()) / 1000.0, 1.0)
-    ax2.set_xlim(0, max_val * 1.28)
-    ax2.set_title("Net Revenue Contribution by Channel ($K)", fontsize=10, fontweight="bold", color=PRIMARY, pad=8)
-    ax2.spines["top"].set_visible(False)
-    ax2.spines["right"].set_visible(False)
-    ax2.xaxis.grid(True, linestyle="--", alpha=0.4)
-
-    for bar, (_, row) in zip(bars, by_ch.iterrows()):
-        ax2.text(
-            bar.get_width() + (max_val * 0.02),
-            bar.get_y() + bar.get_height() / 2,
-            f"${row['net']/1000:.1f}K ({row['share_pct']}%)",
-            va="center",
-            ha="left",
-            fontsize=8,
-            fontweight="bold",
-            color=PRIMARY,
-        )
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(chart_path)), exist_ok=True)
-    plt.savefig(chart_path, dpi=200, bbox_inches="tight")
-    plt.close()
-
+    render_report_charts(metrics, chart_path)
 
 def build_pdf_html(metrics: dict, chart_path: str, html_path: str) -> None:
-    """Builds a 1-page Executive Briefing HTML strictly grounded in dynamic metrics."""
-    with open(chart_path, "rb") as f:
-        chart_b64 = base64.b64encode(f.read()).decode("ascii")
-
-    ch_rows = ""
-    for r in metrics["by_channel"]:
-        ch_rows += f"""
-        <tr>
-          <td><strong>{r['channel']}</strong></td>
-          <td style="text-align:right;">{r['txns']:,}</td>
-          <td style="text-align:right;">${r['gross']:,.2f}</td>
-          <td style="text-align:right;"><strong>${r['net']:,.2f}</strong></td>
-          <td style="text-align:right;">{r['share_pct']}%</td>
-          <td style="text-align:right;">{r['refund_pct']}%</td>
-          <td>{r['status']}</td>
-        </tr>"""
-
-    reg_rows = ""
-    for r in metrics["by_region"]:
-        reg_rows += f"""
-        <tr>
-          <td><strong>{r['region']}</strong></td>
-          <td style="text-align:right;">{r['txns']:,}</td>
-          <td style="text-align:right;"><strong>${r['net']:,.2f}</strong></td>
-          <td style="text-align:right;">{r['share_pct']}%</td>
-        </tr>"""
-
-    bullets_html = "\n".join(f"      <li>{b}</li>" for b in metrics["executive_bullets"])
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <style>
-    :root {{
-      --primary: #0F2537;
-      --accent: #D95D39;
-      --text: #1E293B;
-      --bg: #FFFFFF;
-    }}
-    @page {{
-      size: A4;
-      margin: 12mm 15mm;
-      background: var(--bg);
-      @bottom-right {{
-        content: "Generated by Deliverable-First AI Skill v2.2 | Page " counter(page);
-        font-family: 'Inter', sans-serif;
-        font-size: 8pt;
-        color: #64748B;
-      }}
-    }}
-    *, *::before, *::after {{ box-sizing: border-box; border: none; border-radius: 0; box-shadow: none; background: transparent; }}
-    html, body {{ margin: 0; padding: 0; font-family: 'Inter', 'Noto Sans CJK SC', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 9.5pt; line-height: 1.5; color: var(--text); }}
-    .full-bleed-header {{ background: var(--primary); color: #fff; padding: 10px 18px; margin-bottom: 8px; }}
-    .full-bleed-header h1 {{ color: #fff; font-size: 15pt; margin: 0 0 4px 0; font-weight: 800; }}
-    .full-bleed-header p {{ color: #CBD5E1; font-size: 9pt; margin: 0; }}
-    h2 {{ font-size: 11pt; color: var(--primary); margin: 8px 0 4px 0; font-weight: 700; break-after: avoid; }}
-    p, ul {{ margin: 0 0 8px 0; }}
-    ul {{ padding-left: 18px; }}
-    li {{ margin-bottom: 4px; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 6px 0 10px 0; }}
-    th, td {{ padding: 4px 7px; font-size: 9pt; text-align: left; }}
-    th {{ border-bottom: 2px solid var(--primary); color: var(--primary); font-weight: 700; }}
-    td {{ border-bottom: 1px solid rgba(0,0,0,0.08); }}
-    figure {{ margin: 8px 0; break-inside: avoid; }}
-    img {{ width: 100%; height: auto; display: block; }}
-    tr {{ break-inside: avoid; }}
-  </style>
-</head>
-<body>
-  <main class="document-flow">
-    <div class="full-bleed-header">
-      <h1>Weekly Revenue &amp; Operations Executive Briefing ({metrics['latest_week']})</h1>
-      <p>Automated via Deterministic CSV-to-PDF Skill Pipeline v2.2 | Verified Rows: {metrics['total_rows']:,} | Net Realization Rate (Post-Fee &amp; Refund Retained: {metrics['net_realization_rate_pct']}%)</p>
-    </div>
-
-    <p>Calculated as Net Revenue ÷ Gross Volume (typically gross less fees and refunds). Does not include operating overhead, COGS, or taxes. If net revenue is supplied, its accounting basis depends on the source.</p>
-    <h2>1. Top-Line Deterministic KPI Summary (Verified via Pandas — Zero LLM Math)</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Total Transactions</th>
-          <th style="text-align:right;">Gross Volume (USD)</th>
-          <th style="text-align:right;">Payment Fees (USD)</th>
-          <th style="text-align:right;">Net Revenue (USD)</th>
-          <th style="text-align:right;">Avg Order Value</th>
-          <th style="text-align:right;">Latest Period Net Delta</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><strong>{metrics['total_rows']:,} rows</strong></td>
-          <td style="text-align:right;">${metrics['gross_total']:,.2f}</td>
-          <td style="text-align:right;">${metrics['fee_total']:,.2f}</td>
-          <td style="text-align:right;"><strong>${metrics['net_total']:,.2f}</strong></td>
-          <td style="text-align:right;">${metrics['aov']:,.2f}</td>
-          <td style="text-align:right;"><strong>{metrics['wow_delta_str']}</strong></td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>2. Data-Driven Executive Commentary &amp; Anomaly Audit (Regex Linter Verified)</h2>
-    <ul>
-{bullets_html}
-    </ul>
-
-    <figure>
-      <img src="data:image/png;base64,{chart_b64}" alt="Weekly Trend and Channel Breakdown">
-    </figure>
-
-    <h2>3. Channel Performance &amp; Automated SLA Margin Audit</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Revenue Channel</th>
-          <th style="text-align:right;">Txns</th>
-          <th style="text-align:right;">Gross Revenue</th>
-          <th style="text-align:right;">Net Revenue</th>
-          <th style="text-align:right;">Net Share</th>
-          <th style="text-align:right;">Cum. Refund Rate</th>
-          <th>Automated Audit Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {ch_rows}
-      </tbody>
-    </table>
-
-    <h2>4. Regional Revenue Breakdown</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Geographic Region</th>
-          <th style="text-align:right;">Transactions</th>
-          <th style="text-align:right;">Net Revenue (USD)</th>
-          <th style="text-align:right;">Regional Share</th>
-        </tr>
-      </thead>
-      <tbody>
-        {reg_rows}
-      </tbody>
-    </table>
-  </main>
-</body>
-</html>"""
-
-    os.makedirs(os.path.dirname(os.path.abspath(html_path)), exist_ok=True)
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    build_report_html(metrics, chart_path, html_path)
 
 
 def compile_html_to_pdf_and_verify(html_path: str, pdf_path: str, max_pages: int = 1, allow_html_only: bool = False) -> bool:
@@ -836,6 +486,9 @@ def render_x_card(raw_csv_path: str, pdf_path: str, x_card_path: str, total_rows
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deterministic CSV-to-Executive-PDF Pipeline v2.2 (Strict Validation)")
+    parser.add_argument("--currency", choices=list(CURRENCIES), default="USD", help="Input currency; labeling only, no conversion.")
+    parser.add_argument("--report-basis", choices=["net", "gross"], default="net", help="Gross mode permits unavailable fee/refund/net columns; net mode remains strict.")
+    parser.add_argument("--report-note", default="", help="Source, scope and exclusions shown on the report.")
     parser.add_argument("--input", type=str, default="", help="Path to existing input CSV file.")
     parser.add_argument("--demo", action="store_true", help="Explicitly generate and run 4,200-row synthetic demo dataset.")
     parser.add_argument("--demo-csv-out", type=str, default="raw_stripe_export_4200_rows.csv", help="Output path for synthetic demo CSV.")
@@ -872,7 +525,7 @@ def main() -> None:
 
         os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
         with open(args.output_json, "w", encoding="utf-8") as jf:
-            json.dump(metrics_data, jf, indent=2, ensure_ascii=False)
+            json.dump(metrics_data, jf, indent=2, ensure_ascii=False, allow_nan=False)
         print(f"[METRICS VERIFIED] Exported deterministic summary JSON to: {args.output_json}")
 
         lint_executive_copy(metrics_data["executive_bullets"])
@@ -888,7 +541,7 @@ def main() -> None:
             render_x_card(csv_source_path, args.output_pdf, args.output_card, total_rows=metrics_data["total_rows"])
 
         elapsed = round(time.time() - t0, 2)
-        print(f"[SUCCESS] End-to-end pipeline verified and completed in {elapsed}s.")
+        print(f"[SUCCESS] PDF pipeline completed in {elapsed}s." if pdf_ok else f"[HTML ONLY] PDF not produced; elapsed {elapsed}s.")
     except (FileNotFoundError, ValueError, RuntimeError) as err:
         sys.stderr.write(f"[PIPELINE ERROR] {err}\n")
         sys.exit(2)

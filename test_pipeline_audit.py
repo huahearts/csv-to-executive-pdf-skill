@@ -18,6 +18,8 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import patch
 import pandas as pd
 
 import csv_to_pdf_pipeline as en_pipe
@@ -25,6 +27,52 @@ import csv_to_pdf_pipeline_zh as zh_pipe
 
 
 class TestPipelineStrictAudit(unittest.TestCase):
+
+    def test_gross_mode_preserves_unknown_financials_and_gbp(self):
+        for pipe in (en_pipe, zh_pipe):
+            with self.subTest(language=pipe.__name__), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'sales.csv'
+                pd.DataFrame({'id': ['1', '2'], 'period': ['2011-W47', '2011-W48'], 'segment': ['Retail & <Online>'] * 2, 'country': ['UK'] * 2, 'sales': [100, 150]}).to_csv(path, index=False)
+                args = SimpleNamespace(input=str(path), demo=False, col_id='id', col_period='period', col_channel='segment', col_region='country', col_gross='sales', col_fee='fee', col_refund='refund', col_net='net', estimate_missing_fees=False, assume_zero_refunds=False, derive_net_from_gross=False, currency='GBP', report_basis='gross', report_note='Sales only; fees and refunds unknown.')
+                load = pipe.load_and_validate_csv if pipe is en_pipe else pipe.load_and_validate_csv_zh
+                compute = pipe.compute_deterministic_metrics if pipe is en_pipe else pipe.compute_metrics_zh
+                render = pipe.build_pdf_html if pipe is en_pipe else pipe.build_pdf_html_zh
+                frame, _ = load(args)
+                metrics = compute(frame)
+                self.assertEqual(metrics['currency'], 'GBP')
+                self.assertEqual(metrics['gross_total'], 250)
+                self.assertEqual(metrics['period_delta_pct'], 50)
+                for key in ('fee_total', 'refund_rate', 'net_total', 'net_realization_rate_pct'):
+                    self.assertIsNone(metrics[key], key)
+                self.assertEqual(metrics['anomalies'], [])
+                self.assertIsNone(metrics['by_channel'][0]['refund_pct'])
+                json.dumps(metrics, allow_nan=False)
+                from PIL import Image
+                chart = Path(tmp) / 'chart.png'
+                Image.new('RGB', (2, 2)).save(chart)
+                html = Path(tmp) / 'report.html'
+                render(metrics, str(chart), str(html))
+                text = html.read_text(encoding='utf-8')
+                self.assertIn('GBP', text)
+                self.assertIn('£250.00', text)
+                self.assertNotIn('USD', text)
+                self.assertNotIn('$', text)
+                self.assertNotIn('Within Target', text)
+                self.assertNotIn('正常受控', text)
+                self.assertIn('Retail &amp; &lt;Online&gt;', text)
+
+    def test_long_channel_label_is_not_truncated(self):
+        import matplotlib.axes
+        label = 'A genuinely long retail segment name with a unique ending XYZ'
+        labels = []
+        original = matplotlib.axes.Axes.set_yticklabels
+        def capture(axis, values, *args, **kwargs):
+            labels.extend(str(value) for value in values)
+            return original(axis, values, *args, **kwargs)
+        frame = pd.DataFrame({'txn_id': ['a', 'b'], 'week': ['2026-W09', '2026-W10'], '_sort_key': [en_pipe.parse_period_sort_key('2026-W09')[1], en_pipe.parse_period_sort_key('2026-W10')[1]], 'channel': [label] * 2, 'region': ['UK'] * 2, 'gross_usd': [100, 150], 'stripe_fee_usd': [2, 3], 'refunded': [0, 0], 'net_usd': [98, 147]})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(matplotlib.axes.Axes, 'set_yticklabels', capture):
+            en_pipe.render_executive_charts(en_pipe.compute_deterministic_metrics(frame), str(Path(tmp) / 'chart.png'))
+        self.assertIn(label, [' '.join(text.split()) for text in labels])
 
     def test_weighted_other_channel_refund_rate(self):
         for pipe, aggregate, key in [(en_pipe, en_pipe._aggregate_top_n, 'channel'), (zh_pipe, zh_pipe._aggregate_top_n_zh, '业务渠道')]:

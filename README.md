@@ -29,7 +29,7 @@ The bundled PDF and comparison images are v2.1 examples; generate fresh outputs 
 
 ## Quick Start
 
-### 1. Run the Automated Audit Test Suite (6 Unit & Integration Tests)
+### 1. Run the Automated Audit Test Suite
 ```bash
 python3 test_pipeline_audit.py
 ```
@@ -66,7 +66,23 @@ If the CSV does not contain the default `net_usd` column, use `--derive-net-from
 
 Net realization rate is net revenue divided by gross volume, typically gross less fees and refunds; it excludes operating overhead, COGS and taxes. Supplied net amounts follow the source accounting definition.
 
-*(If your export does not include a fee or refund column, explicitly append `--estimate-missing-fees` or `--assume-zero-refunds`.)*
+For net reports, missing fees or refund flags require explicit assumptions (`--estimate-missing-fees` or `--assume-zero-refunds`). These assumptions are labeled in the report and are not evidence of observed refund compliance. The built-in fee estimate is USD-only.
+
+### 4. Report sales when fees and refunds are unknown
+
+```bash
+python3 csv_to_pdf_pipeline.py \
+  --input sales.csv \
+  --col-gross gross_gbp \
+  --currency GBP \
+  --report-basis gross \
+  --report-note "UCI Online Retail: positive sales invoices; cancellations excluded. Segment is a dataset classification, not a marketing channel." \
+  --output-pdf sales_briefing.pdf
+```
+
+The CSV must also contain `txn_id`, `week`, `channel`, and `region`, or map them with `--col-*`. Aggregate invoice lines to one row per invoice before reporting invoice counts. In gross mode, absent fee, refund and net columns remain unavailable (`null` in JSON and “Not provided” in the PDF). Do not insert placeholder zero columns: supplied zeros are treated as observations. No refund health conclusion is generated for unavailable or assumed refund flags. Supplied financial columns still receive strict validation.
+
+`--currency` supports USD, GBP, EUR, CNY and JPY. It labels amounts without currency conversion; all rows must use that currency. Legacy default column names ending in `_usd` are retained for compatibility; map the actual amount column with `--col-gross`. Both language entry points require the adjacent `report_support.py` module. Long segment names wrap instead of being truncated. `--report-note` records source, date range and exclusions in the PDF.
 
 ## License
 MIT License — see [LICENSE](LICENSE).
