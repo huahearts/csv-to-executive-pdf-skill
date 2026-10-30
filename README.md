@@ -1,47 +1,72 @@
-# Deliverable-First AI Skill: Raw CSV to Board-Ready Executive PDF
+# Deliverable-First AI Skill (v2.2): Raw CSV to Board-Ready Executive PDF
 
-Stop pasting raw CSV exports into LLM chat windows and praying the math and table formatting hold up.
-
-This repository contains the deterministic **Codex / Claude Code Skill (`SKILL.md`)**, the **29-Word Anti-AI Executive Style Guard (`anti_ai_style_guard.md`)**, and the **Python rendering pipeline (`csv_to_pdf_pipeline.py`)** to turn 4,000+ rows of Stripe, Shopify, or SaaS operational logs into a 1-page, board-ready A4 PDF briefing in 14 seconds.
+Turn raw transaction CSV exports (Stripe, Shopify, or SaaS logs) into a verified, 1-page A4 Executive Briefing PDF using deterministic `pandas` math, strict input validation, regex vocabulary linting, and Headless Chromium vector compilation.
 
 ![Before and After Comparison](post_01_before_after_demo_card.png)
 
-## Why Deterministic Pipelines Beat Prompt-Only Reporting
+The bundled PDF and comparison images are v2.1 examples; generate fresh outputs for v2.2 terminology.
 
-1. **Zero LLM Arithmetic (`pandas`):** The script computes 100% of revenue totals, week-over-week deltas, channel shares, and automated refund-spike anomaly flags before the model ever sees the data.
-2. **High-DPI Vector Plots (`matplotlib`):** Pre-renders 200 DPI two-tone charts (`#0F2537` Deep Navy & `#D95D39` Terracotta) with native **English, Chinese, and Japanese (CJK)** typography support out of the box.
-3. **29-Word Anti-AI Style Guard:** Strips out robotic corporate filler (*"delve"*, *"tapestry"*, *"in today's fast-paced world"*) and forces metric-led causal commentary.
-4. **Zero Sliced Tables (`Headless Chromium`):** Enforces CSS `break-inside: avoid` across every table row and figure container so tables never split awkwardly across page boundaries.
+## How v2.2 Enforces Financial & Layout Integrity
 
-## Repository Contents
+1. **Strict Input & Accounting Validation (Zero Silent Coercion):**
+   - **No Silent Mock Fallback:** Passing a non-existent `--input` file fails immediately with `FileNotFoundError` (exit code `2`). Synthetic demo data is only generated when `--demo` is explicitly passed.
+   - **No Silent Zero-Coercion:** Unparseable numeric values or `NaN` cells raise a `ValueError` citing the exact row index. Boolean refund flags (`0/1`, `true/false`, `yes/no`, `y/n`, `refunded/paid`, `是/否`, `已退款/未退款`) are strictly mapped; unknown labels fail fast.
+   - **Explicit Accounting Opt-Ins:** Fee and refund columns are required by default. Estimating fees (`2.9% + $0.30`) or assuming zero refunds requires explicit CLI flags (`--estimate-missing-fees`, `--assume-zero-refunds`).
+2. **Chronological Period Parsing & Consistent PoP States:**
+   - Parses ISO weeks (`2026-W9`, `2026-W10`), months (`YYYY-MM`), quarters (`YYYY-Qq`), and dates (`YYYY-MM-DD`) into chronological tuples so `2026-W10` always sorts after `2026-W9`.
+   - When prior-period net revenue is `<= $0` or only a single period exists, `wow_net_delta` is set to `null` and reported consistently as `N/A (not calculable)` across JSON, KPI tables, and executive prose (never outputting a contradictory `+0.0%`).
+3. **Evidence-Bounded Commentary & Regex Vocabulary Linter:**
+   - Executive bullets are dynamically assembled from `summary_metrics.json` (covering Top Channel, Net Realization Rate, Period-over-Period Delta, Refund SLA Breaches, and Geographic Concentration) without fabricating root causes outside the CSV.
+   - Built-in regex linter (`lint_executive_copy`) scans output against the banned vocabulary list in `anti_ai_style_guard.md`.
+4. **Top-N Table Aggregation & Hard PDF Page-Budget Verification:**
+   - Channels and regions beyond `--max-table-rows 6` are automatically grouped into `"Other (N segments)"` to prevent table overflow.
+   - Headless Chromium compiles the vector PDF and `pypdfium2` verifies the final page count against `--max-pages 1`. Missing browser dependencies or page-budget overflows exit with code `2` (unless `--allow-html-only` is explicitly passed).
 
-| File | Description |
-| :--- | :--- |
-| `SKILL.md` | Drop-in agent skill definition for **Codex** and **Claude Code** |
-| `anti_ai_style_guard.md` | The 29-word core constraint + hard-banned AI vocabulary linter list |
-| `csv_to_pdf_pipeline.py` | English edition: generates mock 4,200-row CSV, computes KPIs, renders charts & HTML |
-| `csv_to_pdf_pipeline_zh.py` | Chinese/CJK edition: native `Noto Sans CJK` rendering for Asian markets |
-| `sample_executive_briefing_report.pdf` | Compiled 1-page A4 Executive Briefing sample (English) |
-| `sample_executive_briefing_report_zh.pdf` | Compiled 1-page A4 Executive Briefing sample (Chinese) |
+## System Requirements
 
-## Quick Start (Run Locally in 60 Seconds)
+- **Python 3.10+** with `pandas`, `numpy`, `matplotlib`, `pillow`, `pypdfium2`, `selenium`
+- **Google Chrome or Chromium** + matching **ChromeDriver** on `PATH` (required for native PDF compilation; pass `--allow-html-only` in environments without a browser).
 
+## Quick Start
+
+### 1. Run the Automated Audit Test Suite (6 Unit & Integration Tests)
 ```bash
-# 1. Install lightweight dependencies
-pip install pandas numpy matplotlib pillow pypdfium2 selenium
-
-# 2. Run the English pipeline (generates 4,200 mock rows + HTML/Charts)
-python3 csv_to_pdf_pipeline.py
-
-# 3. Or run the Chinese/CJK pipeline
-python3 csv_to_pdf_pipeline_zh.py
+python3 test_pipeline_audit.py
 ```
 
-## Adapting to Your Own CSV Schema
+### 2. Run End-to-End Synthetic Demo (`--demo`)
+```bash
+pip install pandas numpy matplotlib pillow pypdfium2 selenium
 
-Open `csv_to_pdf_pipeline.py` and update the column mapping inside `compute_deterministic_metrics(df)`:
-- Replace `gross_usd`, `net_usd`, `stripe_fee_usd`, and `refunded` with your custom export column headers.
-- Adjust the anomaly threshold rule (`r["refund_pct"] > 3.5`) to match your team's SLA targets.
+# English Demo (4,200 rows -> JSON -> Linter -> Charts -> HTML -> 1-Page PDF -> X Card)
+python3 csv_to_pdf_pipeline.py --demo
+
+# Chinese/CJK Demo
+python3 csv_to_pdf_pipeline_zh.py --demo
+```
+
+### 3. Run on Your Real Business CSV
+```bash
+python3 csv_to_pdf_pipeline.py \
+  --input /path/to/orders.csv \
+  --col-id order_id \
+  --col-period billing_week \
+  --col-channel channel \
+  --col-region region \
+  --col-gross gross_amount \
+  --col-fee gateway_fee \
+  --col-refund is_refunded \
+  --derive-net-from-gross \
+  --refund-threshold 3.5 \
+  --max-table-rows 6 \
+  --max-pages 1 \
+  --output-pdf weekly_briefing.pdf
+```
+If the CSV does not contain the default `net_usd` column, use `--derive-net-from-gross` to explicitly derive net as zero for refunded transactions, otherwise gross minus fees, or use `--col-net` to select an existing net column.
+
+Net realization rate is net revenue divided by gross volume, typically gross less fees and refunds; it excludes operating overhead, COGS and taxes. Supplied net amounts follow the source accounting definition.
+
+*(If your export does not include a fee or refund column, explicitly append `--estimate-missing-fees` or `--assume-zero-refunds`.)*
 
 ## License
-MIT License — free for personal and commercial use.
+MIT License — see [LICENSE](LICENSE).

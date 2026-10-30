@@ -1,0 +1,186 @@
+{
+  "total_rows": 4200,
+  "gross_total": 1210209.6,
+  "net_total": 1142000.86,
+  "fee_total": 36356.29,
+  "net_realization_rate_pct": 94.4,
+  "refund_rate": 2.93,
+  "aov": 288.15,
+  "latest_week": "2026-W42",
+  "latest_week_net": 161756.69,
+  "wow_net_delta": 3.7,
+  "wow_delta_str": "+3.7% (2026-W42 vs 2026-W41)",
+  "refund_threshold": 3.5,
+  "executive_bullets": [
+    "Primary Revenue Driver — Enterprise Annual: Generated $930,219.54 (81.5% of total net revenue, overall net realization rate 94.4%) across 751 transactions, with 2026-W42 net revenue changing +3.7% vs 2026-W41.",
+    "Threshold Alert — Self-Serve Starter Refund Rate: Automated checks flagged a 12.57% refund rate in 2026-W42 (cumulative rate: 3.97%, exceeding the 3.5% SLA threshold). Evidence is limited to transaction records; cross-check support tickets and payment gateway logs to isolate the root cause.",
+    "Geographic Concentration: North America ($556,695.98, 48.7%) and Europe (UK/EU) ($293,719.81, 25.7%) accounted for 74.4% of total net volume."
+  ],
+  "anomalies": [
+    {
+      "channel": "Self-Serve Starter",
+      "cumulative_refund_pct": 3.97,
+      "latest_period_refund_pct": 12.57,
+      "period": "2026-W42",
+      "threshold_pct": 3.5
+    }
+  ],
+  "weekly": [
+    {
+      "week": "2026-W35",
+      "txns": 409,
+      "gross": 115856.13,
+      "net": 108372.95,
+      "refund_pct": 2.2
+    },
+    {
+      "week": "2026-W36",
+      "txns": 470,
+      "gross": 143366.32,
+      "net": 137085.34,
+      "refund_pct": 2.98
+    },
+    {
+      "week": "2026-W37",
+      "txns": 485,
+      "gross": 148453.27,
+      "net": 141859.24,
+      "refund_pct": 2.47
+    },
+    {
+      "week": "2026-W38",
+      "txns": 506,
+      "gross": 144346.25,
+      "net": 134423.27,
+      "refund_pct": 1.58
+    },
+    {
+      "week": "2026-W39",
+      "txns": 533,
+      "gross": 149636.71,
+      "net": 141906.44,
+      "refund_pct": 2.44
+    },
+    {
+      "week": "2026-W40",
+      "txns": 550,
+      "gross": 167807.63,
+      "net": 160592.27,
+      "refund_pct": 2.73
+    },
+    {
+      "week": "2026-W41",
+      "txns": 581,
+      "gross": 167250.2,
+      "net": 156004.66,
+      "refund_pct": 2.58
+    },
+    {
+      "week": "2026-W42",
+      "txns": 666,
+      "gross": 173493.09,
+      "net": 161756.69,
+      "refund_pct": 5.56
+    }
+  ],
+  "by_channel": [
+    {
+      "channel": "Enterprise Annual",
+      "txns": 751,
+      "refunded_txns": 20,
+      "latest_txns": 106,
+      "latest_refunded_txns": 4,
+      "gross": 985238.99,
+      "net": 930219.54,
+      "share_pct": 81.5,
+      "refund_pct": 2.66,
+      "latest_refund_pct": 3.77,
+      "status": "✓ Within Target (<3.5%)",
+      "is_anomaly": false
+    },
+    {
+      "channel": "Pro Monthly",
+      "txns": 1423,
+      "refunded_txns": 36,
+      "latest_txns": 238,
+      "latest_refunded_txns": 9,
+      "gross": 123343.59,
+      "net": 116457.83,
+      "share_pct": 10.2,
+      "refund_pct": 2.53,
+      "latest_refund_pct": 3.78,
+      "status": "✓ Within Target (<3.5%)",
+      "is_anomaly": false
+    },
+    {
+      "channel": "Partner Referral",
+      "txns": 365,
+      "refunded_txns": 5,
+      "latest_txns": 63,
+      "latest_refunded_txns": 1,
+      "gross": 39836.06,
+      "net": 38000.67,
+      "share_pct": 3.3,
+      "refund_pct": 1.37,
+      "latest_refund_pct": 1.59,
+      "status": "✓ Within Target (<3.5%)",
+      "is_anomaly": false
+    },
+    {
+      "channel": "Self-Serve Starter",
+      "txns": 1159,
+      "refunded_txns": 46,
+      "latest_txns": 175,
+      "latest_refunded_txns": 22,
+      "gross": 36846.88,
+      "net": 34033.56,
+      "share_pct": 3.0,
+      "refund_pct": 3.97,
+      "latest_refund_pct": 12.57,
+      "status": "⚠ Anomaly: 12.57% in 2026-W42 (Cum: 3.97%)",
+      "is_anomaly": true
+    },
+    {
+      "channel": "Usage Add-on",
+      "txns": 502,
+      "refunded_txns": 16,
+      "latest_txns": 84,
+      "latest_refunded_txns": 1,
+      "gross": 24944.08,
+      "net": 23289.26,
+      "share_pct": 2.0,
+      "refund_pct": 3.19,
+      "latest_refund_pct": 1.19,
+      "status": "✓ Within Target (<3.5%)",
+      "is_anomaly": false
+    }
+  ],
+  "by_region": [
+    {
+      "region": "North America",
+      "txns": 2023,
+      "net": 556695.98,
+      "share_pct": 48.7
+    },
+    {
+      "region": "Europe (UK/EU)",
+      "txns": 1059,
+      "net": 293719.81,
+      "share_pct": 25.7
+    },
+    {
+      "region": "Japan (APAC)",
+      "txns": 707,
+      "net": 193665.24,
+      "share_pct": 17.0
+    },
+    {
+      "region": "Singapore/SEA",
+      "txns": 411,
+      "net": 97919.83,
+      "share_pct": 8.6
+    }
+  ],
+  "total_distinct_channels": 5,
+  "total_distinct_regions": 4
+}
