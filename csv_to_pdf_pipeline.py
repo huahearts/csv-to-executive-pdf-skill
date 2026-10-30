@@ -13,9 +13,10 @@ Fixes all 8 strict engineering audit findings:
 8. 100% alignment between SKILL.md, README.md, and code implementation (Net Realization Rate, Top Channels, Refund SLA Audit).
 """
 
-from report_support import CURRENCIES, compute_report_metrics, render_report_charts, build_report_html
+from report_support import CURRENCIES, compute_report_metrics, render_report_charts, build_report_html, validate_money_precision
 
 import argparse
+from decimal import Decimal
 import base64
 from datetime import datetime
 import json
@@ -173,7 +174,7 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
                 f"Specified --input file does not exist: '{args.input}'. "
                 f"(To generate synthetic demo data, omit --input and pass --demo explicitly.)"
             )
-        raw_df = pd.read_csv(args.input)
+        raw_df = pd.read_csv(args.input, dtype=str)
         source_path = args.input
     elif args.demo:
         source_path = args.demo_csv_out
@@ -193,10 +194,23 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
             f"Missing required columns in CSV: {missing_base}. Available columns: {list(raw_df.columns)}"
         )
 
+    for money_col in (args.col_gross, args.col_fee, args.col_net, getattr(args, "col_refund_amount", "")):
+        if money_col and money_col in raw_df.columns:
+            validate_money_precision(raw_df[money_col], money_col)
+
     basis = getattr(args, "report_basis", "net")
     currency = getattr(args, "currency", "USD")
     if args.estimate_missing_fees and currency != "USD":
         raise ValueError("The built-in fee estimate is USD-only; provide actual fees for other currencies.")
+    for source in (args.col_id, args.col_period, args.col_channel, args.col_region):
+        column = raw_df[source]
+        invalid = column.isna() | column.astype(str).str.strip().eq("")
+        if invalid.any():
+            raise ValueError(f"Required column {source!r} has blank values at row indices {column.index[invalid].tolist()[:5]}.")
+    ids = raw_df[args.col_id].astype(str).str.strip()
+    duplicates = ids.duplicated(keep=False)
+    if duplicates.any():
+        raise ValueError(f"Duplicate transaction IDs at row indices {ids.index[duplicates].tolist()[:5]}; aggregate or deduplicate upstream.")
     df = pd.DataFrame()
     df["txn_id"] = raw_df[args.col_id].astype(str).str.strip()
     df["week"] = raw_df[args.col_period].astype(str).str.strip()
@@ -248,13 +262,25 @@ def load_and_validate_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     elif args.derive_net_from_gross or not args.col_net:
         if df["stripe_fee_usd"].isna().any() or df["refunded"].isna().any():
             raise ValueError("Cannot derive net amount when fee or refund data is unavailable.")
-        df["net_usd"] = np.where(df["refunded"] == 1, 0.0, df["gross_usd"] - df["stripe_fee_usd"]).round(2)
+        refund_column = getattr(args, "col_refund_amount", "")
+        if refund_column:
+            if refund_column not in raw_df.columns:
+                raise ValueError(f"Refund amount column {refund_column!r} is missing.")
+            amounts = parse_strict_numeric_series(raw_df[refund_column], refund_column)
+            invalid = (amounts < 0) | (amounts > df["gross_usd"]) | ((amounts > 0) != (df["refunded"] == 1))
+            if invalid.any():
+                raise ValueError(f"Refund amounts must be nonnegative, at most gross and agree with refund flags; row indices {amounts.index[invalid].tolist()[:5]}.")
+        elif (df["refunded"] == 1).any():
+            raise ValueError("Refund amount required to derive net for refunded transactions; pass --col-refund-amount or provide --col-net.")
+        else:
+            amounts = pd.Series(0, index=df.index)
+        df["net_usd"] = [float(Decimal(str(g)) - Decimal(str(f)) - Decimal(str(r))) for g, f, r in zip(df["gross_usd"], df["stripe_fee_usd"], amounts)]
     elif basis == "gross":
         df["net_usd"] = float("nan")
     else:
         raise ValueError(
             f"Net revenue column '{args.col_net}' is missing from CSV. Pass '--derive-net-from-gross' "
-            f"to compute net_usd = (0 if refunded else gross - fee)."
+            f"to compute net from gross, fees and actual refund amounts."
         )
 
     df.attrs.update(
@@ -448,21 +474,9 @@ def render_x_card(raw_csv_path: str, pdf_path: str, x_card_path: str, total_rows
     left_box = (48, 86, 750, 912)
     draw.rectangle(left_box, fill=(15, 23, 42), outline=(71, 85, 105), width=2)
     draw.rectangle((48, 86, 750, 134), fill=(30, 41, 59))
-    draw.text((68, 98), f"BEFORE: {os.path.basename(raw_csv_path)} (Unformatted)", fill=(248, 113, 113), font=font_sub)
+    draw.text((68, 98), "BEFORE: Source CSV", fill=(248, 113, 113), font=font_sub)
 
-    with open(raw_csv_path, "r", encoding="utf-8") as f:
-        lines = [f.readline().strip() for _ in range(38)]
-
-    y_text = 150
-    for idx, line in enumerate(lines):
-        if not line:
-            break
-        display_line = (line[:62] + "...") if len(line) > 65 else line
-        color = (148, 163, 184) if idx > 0 else (56, 189, 248)
-        draw.text((64, y_text), display_line, fill=color, font=font_mono)
-        y_text += 19
-    remaining = max(0, total_rows - len(lines) + 1)
-    draw.text((64, y_text + 6), f"... [{remaining:,} more unformatted rows] ...", fill=(217, 93, 57), font=font_mono)
+    draw.text((64, 155), "Source rows hidden to protect privacy.", fill=(148, 163, 184), font=font_sub)
 
     right_box = (810, 86, 1552, 912)
     draw.rectangle(right_box, fill=(241, 245, 249), outline=(217, 93, 57), width=3)
@@ -502,13 +516,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-html-only", action="store_true", help="Do not fail with exit code != 0 if Chromium is unavailable.")
     parser.add_argument("--estimate-missing-fees", action="store_true", help="Explicitly allow estimating fees (2.9% + $0.30) if fee column is absent.")
     parser.add_argument("--assume-zero-refunds", action="store_true", help="Explicitly allow setting refunded=0 if refund column is absent.")
-    parser.add_argument("--derive-net-from-gross", action="store_true", help="Compute net_usd = (0 if refunded else gross - fee) if net column is absent.")
+    parser.add_argument("--derive-net-from-gross", action="store_true", help="Derive net = gross - fees - refund amount; refunded rows require --col-refund-amount.")
     parser.add_argument("--col-id", type=str, default="txn_id", help="Transaction ID column name.")
     parser.add_argument("--col-period", type=str, default="week", help="Time period / week column name.")
     parser.add_argument("--col-channel", type=str, default="channel", help="Channel / segment column name.")
     parser.add_argument("--col-region", type=str, default="region", help="Geographic region column name.")
     parser.add_argument("--col-gross", type=str, default="gross_usd", help="Gross revenue column name.")
     parser.add_argument("--col-fee", type=str, default="stripe_fee_usd", help="Fee column name.")
+    parser.add_argument("--col-refund-amount", default="", help="Column containing actual refunded amount for net derivation.")
     parser.add_argument("--col-refund", type=str, default="refunded", help="Refund flag column name.")
     parser.add_argument("--col-net", type=str, default="net_usd", help="Net revenue column name.")
     return parser.parse_args()

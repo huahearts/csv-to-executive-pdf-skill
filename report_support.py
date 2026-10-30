@@ -4,6 +4,7 @@ import base64
 import html
 import math
 import textwrap
+from decimal import Decimal
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,13 +13,26 @@ import pandas as pd
 CURRENCIES = {"USD": "$", "GBP": "£", "EUR": "€", "CNY": "¥", "JPY": "¥"}
 
 
+def validate_money_precision(series, column):
+    """Require exact hundredths and bounded amounts before float conversion."""
+    for idx, value in series.items():
+        cleaned = str(value).strip().lstrip('$€£¥').replace(',', '')
+        try:
+            number = Decimal(cleaned)
+            if not number.is_finite() or abs(number) > Decimal('1000000000000') or number != number.quantize(Decimal('0.01')):
+                raise ValueError
+        except Exception as exc:
+            raise ValueError(f"Amount column {column!r} must contain finite values within +/- 1e12 and at most two decimals; row {idx}: {value!r}.") from exc
+
+
 def money(value, currency):
     return "N/A" if value is None else f"{CURRENCIES[currency]}{value:,.2f}"
 
 
 def _sum(series):
-    result = series.sum(min_count=1)
-    if pd.isna(result):
+    values = series.dropna()
+    result = sum((Decimal(str(value)) for value in values), Decimal(0)) if not values.empty else None
+    if result is None:
         return None
     if not math.isfinite(float(result)):
         raise ValueError("Aggregated amount is not finite.")

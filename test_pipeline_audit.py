@@ -28,6 +28,61 @@ import csv_to_pdf_pipeline_zh as zh_pipe
 
 class TestPipelineStrictAudit(unittest.TestCase):
 
+    def test_required_text_and_duplicate_ids_rejected(self):
+        for pipe in (en_pipe, zh_pipe):
+            load = pipe.load_and_validate_csv if pipe is en_pipe else pipe.load_and_validate_csv_zh
+            for column, values in [('id', ['1', '1']), ('id', ['1', '']), ('segment', ['Retail', '']), ('country', ['UK', '  '])]:
+                with self.subTest(language=pipe.__name__, column=column, values=values), tempfile.TemporaryDirectory() as tmp:
+                    data = {'id': ['1', '2'], 'period': ['2026-W09', '2026-W10'], 'segment': ['Retail', 'Retail'], 'country': ['UK', 'UK'], 'sales': [100, 100]}
+                    data[column] = values
+                    path = Path(tmp) / 'source.csv'
+                    pd.DataFrame(data).to_csv(path, index=False)
+                    args = SimpleNamespace(input=str(path), demo=False, col_id='id', col_period='period', col_channel='segment', col_region='country', col_gross='sales', col_fee='fee', col_refund='refund', col_net='net', estimate_missing_fees=False, assume_zero_refunds=False, derive_net_from_gross=False, report_basis='gross')
+                    with self.assertRaises(ValueError):
+                        load(args)
+
+    def test_partial_refund_amount_and_missing_amount(self):
+        for pipe in (en_pipe, zh_pipe):
+            load = pipe.load_and_validate_csv if pipe is en_pipe else pipe.load_and_validate_csv_zh
+            compute = pipe.compute_deterministic_metrics if pipe is en_pipe else pipe.compute_metrics_zh
+            with self.subTest(language=pipe.__name__), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'source.csv'
+                pd.DataFrame({'id': ['1','2'], 'period': ['2026-W09']*2, 'segment': ['Retail']*2, 'country': ['UK']*2, 'sales': ['100.00','0.10'], 'fee': ['2.00','0.02'], 'refund': [1,0], 'refund_amount': ['30.00','0.00']}).to_csv(path,index=False)
+                args = SimpleNamespace(input=str(path), demo=False, col_id='id', col_period='period', col_channel='segment', col_region='country', col_gross='sales', col_fee='fee', col_refund='refund', col_net='net', col_refund_amount='refund_amount', estimate_missing_fees=False, assume_zero_refunds=False, derive_net_from_gross=True)
+                frame, _ = load(args)
+                self.assertEqual(compute(frame)['net_total'], 68.08)
+                args.col_refund_amount = ''
+                with self.assertRaisesRegex(ValueError, '[Rr]efund amount'):
+                    load(args)
+
+    def test_money_precision_and_leading_zero_ids(self):
+        for pipe in (en_pipe, zh_pipe):
+            load = pipe.load_and_validate_csv if pipe is en_pipe else pipe.load_and_validate_csv_zh
+            with self.subTest(language=pipe.__name__), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'source.csv'
+                path.write_text('id,period,segment,country,sales\n001,2026-W09,Retail,UK,0.10\n1,2026-W09,Retail,UK,0.20\n', encoding='utf-8')
+                args = SimpleNamespace(input=str(path), demo=False, col_id='id', col_period='period', col_channel='segment', col_region='country', col_gross='sales', col_fee='fee', col_refund='refund', col_net='net', estimate_missing_fees=False, assume_zero_refunds=False, derive_net_from_gross=False, report_basis='gross')
+                frame, _ = load(args)
+                compute = pipe.compute_deterministic_metrics if pipe is en_pipe else pipe.compute_metrics_zh
+                self.assertEqual(compute(frame)['gross_total'], 0.30)
+                path.write_text('id,period,segment,country,sales\n1,2026-W09,Retail,UK,0.005\n', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'two decimals'):
+                    load(args)
+
+    def test_card_never_reads_csv_rows(self):
+        for pipe in (en_pipe, zh_pipe):
+            fn = pipe.render_x_card if pipe is en_pipe else pipe.render_x_card_zh
+            with self.subTest(language=pipe.__name__), tempfile.TemporaryDirectory() as tmp:
+                import pypdfium2 as pdfium
+                # Build a tiny PDF in memory; the CSV path deliberately does not exist.
+                doc = pdfium.PdfDocument.new()
+                page = doc.new_page(100, 100)
+                page.close()
+                pdf = Path(tmp)/'page.pdf'
+                doc.save(pdf)
+                doc.close()
+                self.assertTrue(fn(str(Path(tmp)/'missing-sensitive.csv'), str(pdf), str(Path(tmp)/'card.png'), 1))
+
     def test_gross_mode_preserves_unknown_financials_and_gbp(self):
         for pipe in (en_pipe, zh_pipe):
             with self.subTest(language=pipe.__name__), tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +219,7 @@ class TestPipelineStrictAudit(unittest.TestCase):
                 "region": ["US", "US"],
                 "gross_usd": [100.0, 200.0],
                 "refunded": ["no", "yes"],
+                "refund_amount": [0, 200],
             }).to_csv(csv_path, index=False)
 
             # Without --estimate-missing-fees -> must fail
@@ -181,7 +237,7 @@ class TestPipelineStrictAudit(unittest.TestCase):
                 [
                     sys.executable, "csv_to_pdf_pipeline.py",
                     "--input", csv_path,
-                    "--estimate-missing-fees", "--derive-net-from-gross",
+                    "--estimate-missing-fees", "--derive-net-from-gross", "--col-refund-amount", "refund_amount",
                     "--allow-html-only",
                     "--output-json", out_json,
                     "--output-html", out_html,

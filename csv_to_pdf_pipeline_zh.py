@@ -13,9 +13,10 @@ Fixes all 8 strict engineering audit findings:
 8. Cross-platform CJK font support (Linux, macOS, Windows).
 """
 
-from report_support import CURRENCIES, compute_report_metrics, render_report_charts, build_report_html
+from report_support import CURRENCIES, compute_report_metrics, render_report_charts, build_report_html, validate_money_precision
 
 import argparse
+from decimal import Decimal
 import base64
 from datetime import datetime
 import json
@@ -171,7 +172,7 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
                 f"指定的输入文件不存在: '{args.input}'。"
                 f"（如需生成模拟演示数据，请去掉 --input 并显式传入 --demo 参数。）"
             )
-        raw_df = pd.read_csv(args.input)
+        raw_df = pd.read_csv(args.input, dtype=str)
         source_path = args.input
     elif args.demo:
         source_path = args.demo_csv_out
@@ -188,10 +189,23 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
     if missing_base:
         raise ValueError(f"CSV 缺少必要基础列: {missing_base}。当前可用列: {list(raw_df.columns)}")
 
+    for money_col in (args.col_gross, args.col_fee, args.col_net, getattr(args, "col_refund_amount", "")):
+        if money_col and money_col in raw_df.columns:
+            validate_money_precision(raw_df[money_col], money_col)
+
     basis = getattr(args, "report_basis", "net")
     currency = getattr(args, "currency", "USD")
     if args.estimate_missing_fees and currency != "USD":
         raise ValueError("The built-in fee estimate is USD-only; provide actual fees for other currencies.")
+    for source in (args.col_id, args.col_period, args.col_channel, args.col_region):
+        column = raw_df[source]
+        invalid = column.isna() | column.astype(str).str.strip().eq("")
+        if invalid.any():
+            raise ValueError(f"Required column {source!r} has blank values at row indices {column.index[invalid].tolist()[:5]}.")
+    ids = raw_df[args.col_id].astype(str).str.strip()
+    duplicates = ids.duplicated(keep=False)
+    if duplicates.any():
+        raise ValueError(f"Duplicate transaction IDs at row indices {ids.index[duplicates].tolist()[:5]}; aggregate or deduplicate upstream.")
     df = pd.DataFrame()
     df["订单号"] = raw_df[args.col_id].astype(str).str.strip()
     df["结算周期"] = raw_df[args.col_period].astype(str).str.strip()
@@ -236,7 +250,19 @@ def load_and_validate_csv_zh(args: argparse.Namespace) -> tuple[pd.DataFrame, st
     elif args.derive_net_from_gross or not args.col_net:
         if df["通道手续费_USD"].isna().any() or df["是否退款"].isna().any():
             raise ValueError("Cannot derive net amount when fee or refund data is unavailable.")
-        df["净营收_USD"] = np.where(df["是否退款"] == 1, 0.0, df["总流水_USD"] - df["通道手续费_USD"]).round(2)
+        refund_column = getattr(args, "col_refund_amount", "")
+        if refund_column:
+            if refund_column not in raw_df.columns:
+                raise ValueError(f"Refund amount column {refund_column!r} is missing.")
+            amounts = parse_strict_numeric_series(raw_df[refund_column], refund_column)
+            invalid = (amounts < 0) | (amounts > df["总流水_USD"]) | ((amounts > 0) != (df["是否退款"] == 1))
+            if invalid.any():
+                raise ValueError(f"Refund amounts must be nonnegative, at most gross and agree with refund flags; row indices {amounts.index[invalid].tolist()[:5]}.")
+        elif (df["是否退款"] == 1).any():
+            raise ValueError("Refund amount required to derive net for refunded transactions; pass --col-refund-amount or provide --col-net.")
+        else:
+            amounts = pd.Series(0, index=df.index)
+        df["净营收_USD"] = [float(Decimal(str(g)) - Decimal(str(f)) - Decimal(str(r))) for g, f, r in zip(df["总流水_USD"], df["通道手续费_USD"], amounts)]
     elif basis == "gross":
         df["净营收_USD"] = float("nan")
     else:
@@ -418,24 +444,12 @@ def render_x_card_zh(raw_csv_path: str, pdf_path: str, x_card_path: str, total_r
     draw.rectangle((48, 86, 750, 134), fill=(30, 41, 59))
     draw.text((68, 96), f"处理前 (BEFORE): {total_rows:,} 行杂乱 CSV 原始流水表", fill=(248, 113, 113), font=font_sub)
 
-    with open(raw_csv_path, "r", encoding="utf-8") as f:
-        lines = [f.readline().strip() for _ in range(36)]
-
-    y_text = 150
-    for idx, line in enumerate(lines):
-        if not line:
-            break
-        display_line = (line[:48] + "...") if len(line) > 50 else line
-        color = (148, 163, 184) if idx > 0 else (56, 189, 248)
-        draw.text((64, y_text), display_line, fill=color, font=font_mono)
-        y_text += 20
-    remaining = max(0, total_rows - len(lines) + 1)
-    draw.text((64, y_text + 6), f"... [其余 {remaining:,} 行未排版原始记录] ...", fill=(217, 93, 57), font=font_mono)
+    draw.text((64, 155), "原始数据已隐藏，以保护隐私。", fill=(148, 163, 184), font=font_sub)
 
     right_box = (810, 86, 1552, 912)
     draw.rectangle(right_box, fill=(241, 245, 249), outline=(217, 93, 57), width=3)
     draw.rectangle((810, 86, 1552, 134), fill=(217, 93, 57))
-    draw.text((830, 96), "处理后 (AFTER): 零误差 A4 高管简报 PDF (Pandas + Chromium)", fill=(255, 255, 255), font=font_sub)
+    draw.text((830, 96), "处理后 (AFTER): 确定性计算 A4 高管简报 PDF (Pandas + Chromium)", fill=(255, 255, 255), font=font_sub)
 
     target_h = 748
     aspect = page_pil.width / page_pil.height
@@ -477,6 +491,7 @@ def parse_args_zh() -> argparse.Namespace:
     parser.add_argument("--col-region", type=str, default="销售大区", help="销售大区列名。")
     parser.add_argument("--col-gross", type=str, default="总流水_USD", help="总流水列名。")
     parser.add_argument("--col-fee", type=str, default="通道手续费_USD", help="手续费列名。")
+    parser.add_argument("--col-refund-amount", default="", help="Column containing actual refunded amount for net derivation.")
     parser.add_argument("--col-refund", type=str, default="是否退款", help="是否退款列名。")
     parser.add_argument("--col-net", type=str, default="净营收_USD", help="净营收列名。")
     return parser.parse_args()

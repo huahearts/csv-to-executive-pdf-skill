@@ -34,3 +34,5 @@ For sales-only datasets, use `--report-basis gross` and set the observed input c
 2. Compile HTML to vector PDF via Headless Chromium (`Page.printToPDF`), and verify via `pypdfium2` that the final page count is `<= --max-pages` (default `1`). If compilation fails or exceeds the page budget, raise `RuntimeError` and exit with code `2` (unless `--allow-html-only` is passed).
 
 Net realization rate is net revenue divided by gross volume, typically gross less fees and refunds. It excludes operating overhead, COGS and taxes; provided net values follow the source accounting definition.
+
+For derived net, require actual refund amounts via `--col-refund-amount` for every dataset with refunded rows; calculate gross minus fees minus refund amount and reject inconsistent flags. Do not infer partial or cross-period refunds. Reject blank required identifiers and duplicate transaction IDs. Monetary inputs must fit the documented two-decimal and magnitude limits. Comparison cards hide source rows, but their report thumbnails may still contain sensitive business information.
